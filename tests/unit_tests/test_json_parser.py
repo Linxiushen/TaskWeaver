@@ -123,3 +123,40 @@ bad_cases: List[str] = [
 def test_json_parser_bad(bad_case: str):
     with pytest.raises(json_parser.StreamJsonParserError):
         json_parser.parse_json(bad_case)
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 7, 64])
+def test_surrogate_pairs_in_streamed_keys_and_values(chunk_size: int):
+    message = "Ready \U0001f680\U00020000 \U00010000\U0010ffff!"
+    obj = {"\U0001f680": [message, {"nested": message}]}
+    text = json.dumps(obj)
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    assert json_parser.parse_json(chunks) == obj
+
+    text = json.dumps(message)
+    chunks = [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]
+    events = list(json_parser.parse_json_stream(chunks, skip_ws=True))
+    assert "".join(event.value_str for event in events) == message
+    assert events[-1].value == message
+    for event in events:
+        event.value_str.encode("utf-8")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        r'"\ud83d"',
+        r'"\ude80"',
+        r'"\ud83dA"',
+        r'"\ud83d\n"',
+        r'"\ud83d\u0041"',
+        r'"\ud83d\ud83d\ude80"',
+        r'"\ude80\ud83d"',
+        r'"\\ud83d\\ude80"',
+    ],
+)
+def test_unpaired_surrogates_match_json_loads(text: str):
+    expected = json.loads(text)
+    assert json_parser.parse_json(iter(text)) == expected
+    events = list(json_parser.parse_json_stream(iter(text), skip_ws=True))
+    assert "".join(event.value_str for event in events) == expected

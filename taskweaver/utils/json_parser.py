@@ -138,7 +138,7 @@ def parse_json_stream(
     def parse_str_begin(ch: str, is_obj_key: bool = False) -> bool:
         if ch == '"':
             add_event("map_key" if is_obj_key else "string", "", "", False)
-            state_stack.append(("string", (False, "", "", is_obj_key)))
+            state_stack.append(("string", (False, "", "", is_obj_key, None)))
             return True
         return False
 
@@ -230,8 +230,8 @@ def parse_json_stream(
             raise StreamJsonParserError(f"invalid value for index {idx}: {ch}")
         return False
 
-    def parse_str_value(ch: str, cur_state_ext: Tuple[bool, str, str, bool]) -> bool:
-        in_escape, escape_buf, value_buf, is_obj_key = cur_state_ext
+    def parse_str_value(ch: str, cur_state_ext: Tuple[bool, str, str, bool, Optional[int]]) -> bool:
+        in_escape, escape_buf, value_buf, is_obj_key, high_surrogate = cur_state_ext
         ev: ParserEventType = "map_key" if is_obj_key else "string"
         if in_escape and escape_buf.startswith("u"):
             if ch in "0123456789abcdefABCDEF":
@@ -239,17 +239,31 @@ def parse_json_stream(
             else:
                 raise StreamJsonParserError(f"invalid unicode escape sequence: \\{escape_buf}{ch}")
             if len(escape_buf) == 5:
-                new_ch = chr(int(escape_buf[1:], 16))
+                codepoint = int(escape_buf[1:], 16)
+                new_ch = ""
+                if high_surrogate is not None:
+                    if 0xDC00 <= codepoint <= 0xDFFF:
+                        codepoint = 0x10000 + ((high_surrogate - 0xD800) << 10) + codepoint - 0xDC00
+                    else:
+                        new_ch = chr(high_surrogate)
+                    high_surrogate = None
+                if 0xD800 <= codepoint <= 0xDBFF:
+                    # Wait for a possible low surrogate before emitting a
+                    # character, even when the escape spans stream chunks.
+                    high_surrogate = codepoint
+                else:
+                    new_ch += chr(codepoint)
                 value_buf += new_ch
-                add_event(ev, None, new_ch, False)
-                state_stack[-1] = ("string", (False, "", value_buf, is_obj_key))
+                if new_ch:
+                    add_event(ev, None, new_ch, False)
+                state_stack[-1] = ("string", (False, "", value_buf, is_obj_key, high_surrogate))
             else:
-                state_stack[-1] = ("string", (True, escape_buf, value_buf, is_obj_key))
+                state_stack[-1] = ("string", (True, escape_buf, value_buf, is_obj_key, high_surrogate))
             return True
         if in_escape:
             assert escape_buf == ""
             if ch == "u":
-                state_stack[-1] = ("string", (True, ch, value_buf, is_obj_key))
+                state_stack[-1] = ("string", (True, ch, value_buf, is_obj_key, high_surrogate))
                 return True
             new_ch = ""
             if ch == "n":
@@ -272,10 +286,18 @@ def parse_json_stream(
                 new_ch = '"'
             else:
                 raise StreamJsonParserError(f"invalid escape sequence: \\{ch}")
+            if high_surrogate is not None:
+                new_ch = chr(high_surrogate) + new_ch
             value_buf += new_ch
             add_event(ev, None, new_ch, False)
-            state_stack[-1] = ("string", (False, "", value_buf, is_obj_key))
+            state_stack[-1] = ("string", (False, "", value_buf, is_obj_key, None))
             return True
+        if high_surrogate is not None and ch != "\\":
+            # Preserve lone surrogates, matching the existing parser behavior.
+            new_ch = chr(high_surrogate)
+            value_buf += new_ch
+            add_event(ev, None, new_ch, False)
+            high_surrogate = None
         if ch == '"':
             add_event(ev, value_buf, "", True)
             state_stack.pop()
@@ -284,11 +306,11 @@ def parse_json_stream(
                 state_stack.append(("object_value", (value_buf, False, False)))
             return True
         if ch == "\\":
-            state_stack[-1] = ("string", (True, "", value_buf, is_obj_key))
+            state_stack[-1] = ("string", (True, "", value_buf, is_obj_key, high_surrogate))
             return True
         value_buf += ch
         add_event(ev, None, ch, False)
-        state_stack[-1] = ("string", (False, "", value_buf, is_obj_key))
+        state_stack[-1] = ("string", (False, "", value_buf, is_obj_key, None))
         return True
 
     def parse_literal_value(

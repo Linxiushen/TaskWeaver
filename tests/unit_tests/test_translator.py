@@ -230,6 +230,31 @@ def test_parse_llm2():
     assert response.message == "This is "
 
 
+@pytest.mark.parametrize("chunk_size", [1, 5, 64])
+def test_streamed_post_preserves_supplementary_characters(chunk_size: int):
+    post = Post.create(
+        message="Ready \U0001f680 \U00020000",
+        send_from="CodeInterpreter",
+        send_to="Planner",
+        attachment_list=[Attachment.create(type="thought", content="Check \U0001f4ab")],
+    )
+    raw_text = translator.post_to_raw_text(post)
+    event_emitter = SessionEventEmitter()
+    event_emitter.start_round("unicode_round")
+    post_proxy = event_emitter.create_post_proxy(post.send_from)
+    translator.raw_text_to_post(
+        llm_output=(
+            format_chat_message("assistant", raw_text[i : i + chunk_size]) for i in range(0, len(raw_text), chunk_size)
+        ),
+        post_proxy=post_proxy,
+    )
+    result = post_proxy.end()
+    assert result.message == post.message
+    assert result.send_to == post.send_to
+    assert result.attachment_list[0].content == post.attachment_list[0].content
+    assert result.message.encode("utf-8") == post.message.encode("utf-8")
+
+
 def test_post_to_raw_text():
     post = Post.create(
         message="This is the message",
